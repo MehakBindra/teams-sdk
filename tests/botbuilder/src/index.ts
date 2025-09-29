@@ -25,6 +25,4 @@ app.on('message', async ({ send }) => {
   await send('hi from teams...');
 });
 
-(async () => {
-  await app.start();
-})();
+app.start().catch(console.error);

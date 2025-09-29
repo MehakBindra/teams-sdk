@@ -122,6 +122,4 @@ app.on('message', async ({ send, activity }) => {
 });
 // :snippet-end:
 
-(async () => {
-  await app.start();
-})();
+app.start().catch(console.error);
