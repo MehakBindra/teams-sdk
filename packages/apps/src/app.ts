@@ -5,11 +5,9 @@ import {
   ApiClientSettings,
   ChannelID,
   ConversationReference,
-  Credentials,
-  IToken,
-  JsonWebToken,
   StripMentionsTextOptions,
-  toActivityParams
+  toActivityParams,
+  TokenCredentials,
 } from '@microsoft/teams.api';
 import { EventEmitter } from '@microsoft/teams.common/events';
 import * as http from '@microsoft/teams.common/http';
@@ -41,13 +39,52 @@ import * as middleware from './middleware';
 import { DEFAULT_OAUTH_SETTINGS, OAuthSettings } from './oauth';
 import { HttpPlugin } from './plugins';
 import { Router } from './router';
-import { AppEvents, IPlugin } from './types';
+import { TokenManager } from './token-manager';
+import { IPlugin, AppEvents } from './types';
 import { PluginAdditionalContext } from './types/app-routing';
 
 /**
  * App initialization options
  */
-export type AppOptions<TPlugin extends IPlugin> = Partial<Credentials> & {
+export type AppOptions<TPlugin extends IPlugin> = {
+  /**
+   * client id - Your application's client identifier
+   * Uses environment variable CLIENT_ID if not explicitly provided
+   */
+  readonly clientId?: string;
+
+  /**
+   * client secret - Your application's secret to be able to send messages
+   * as your bot.
+   * Uses environment variable CLIENT_SECRET if not explicitly provided
+   * If not available, uses ManagedIdentity to authenticate
+   */
+  readonly clientSecret?: string;
+
+  /**
+   * tenantId - The tenantId where your app is registered
+   * Uses environment variable TENANT_ID if not explicitly provided
+   * If your app has MultiTenant auth enabled (this value should not be provided).
+   * (Note: That MultiTenant auth has been deprecated, so only legacy apps will have this
+   * value enabled)
+   */
+  readonly tenantId?: string;
+
+  /**
+   * token - An override to perform token fetching.
+   */
+  readonly token?: TokenCredentials['token'];
+
+  /**
+   * managed identity client id - A managed identity client id.
+   * Uses environment variable MANAGED_IDENTITY_CLIENT_ID if not explicitly provided
+   * If:
+   *   - Same as client id, uses User Managed Identity for auth
+   *   - "system", uses System Managed Identity in a Federated Identity Credentials
+   *   - Different from client id or system, uses UMI in a Federated Identity Credentials
+   */
+  managedIdentityClientId?: 'system' | (string & {});
+
   /**
    * http client or client options used to make api requests
    */
@@ -87,7 +124,7 @@ export type AppOptions<TPlugin extends IPlugin> = Partial<Credentials> & {
    * Skip authentication for HTTP requests
    */
   readonly skipAuth?: boolean;
-  
+
   /**
    * API client settings used for overriding.
    */
@@ -104,18 +141,6 @@ export type AppActivityOptions = {
   };
 };
 
-export type AppTokens = {
-  /**
-   * bot token used to send activities
-   */
-  bot?: IToken;
-
-  /**
-   * graph token used to query the graph api
-   */
-  graph?: IToken;
-};
-
 /**
  * The orchestrator for receiving/sending activities
  */
@@ -126,21 +151,29 @@ export class App<TPlugin extends IPlugin = IPlugin> {
   readonly http: HttpPlugin;
   readonly client: http.Client;
   readonly storage: IStorage;
-  readonly credentials?: Credentials;
   readonly entraTokenValidator?: middleware.JwtValidator;
+  readonly tokenManager: TokenManager;
+
+  /**
+   * the apps credentials
+   */
+  get credentials() {
+    return this.tokenManager.credentials;
+  }
 
   /**
    * the apps id
    */
   get id() {
-    return this.tokens.bot?.appId || this.tokens.graph?.appId;
+    return this.credentials?.clientId;
   }
 
   /**
    * the apps name
+   * @deprecated Name will be removed in the near future. Please remove dependencies from it.
    */
   get name() {
-    return this.tokens.bot?.appDisplayName || this.tokens.graph?.appDisplayName;
+    return this._manifest.name?.full;
   }
 
   get oauth() {
@@ -157,9 +190,8 @@ export class App<TPlugin extends IPlugin = IPlugin> {
     return {
       id: this.id,
       name: {
-        short: this.name || '??',
-        full: this.name || '??',
-        ...this._manifest.name,
+        short: this._manifest.name?.short || '??',
+        full: this._manifest.name?.full || '??',
       },
       bots: [
         {
@@ -177,14 +209,6 @@ export class App<TPlugin extends IPlugin = IPlugin> {
     };
   }
   protected readonly _manifest: Partial<manifest.Manifest>;
-
-  /**
-   * the apps auth tokens
-   */
-  get tokens(): AppTokens {
-    return this._tokens;
-  }
-  protected _tokens: AppTokens = {};
 
   protected container = new Container();
   protected plugins: Array<TPlugin> = [];
@@ -230,45 +254,27 @@ export class App<TPlugin extends IPlugin = IPlugin> {
 
     this.api = new ApiClient(
       'https://smba.trafficmanager.net/teams',
-      this.client.clone({ token: () => this._tokens.bot }),
+      this.client.clone({ token: () => this.getBotToken() }),
       this.options.apiClientSettings
     );
 
     this.graph = new GraphClient(
-      this.client.clone({ token: () => this._tokens.graph })
+      this.client.clone({ token: () => this.getAppGraphToken() })
     );
 
-    // initialize credentials
-    const clientId = this.options.clientId || process.env.CLIENT_ID;
-    const clientSecret =
-      ('clientSecret' in this.options
-        ? this.options.clientSecret
-        : undefined) || process.env.CLIENT_SECRET;
-    const tenantId =
-      ('tenantId' in this.options ? this.options.tenantId : undefined) ||
-      process.env.TENANT_ID;
-    const token = 'token' in this.options ? this.options.token : undefined;
+    // initialize TokenManager with credentials
+    this.tokenManager = new TokenManager({
+      clientId: this.options.clientId,
+      clientSecret: this.options.clientSecret,
+      tenantId: this.options.tenantId,
+      token: this.options.token,
+      managedIdentityClientId: this.options.managedIdentityClientId,
+    }, this.log);
 
-    if (clientId && clientSecret) {
-      this.credentials = {
-        clientId,
-        clientSecret,
-        tenantId,
-      };
-    }
-
-    if (clientId && token) {
-      this.credentials = {
-        clientId,
-        tenantId,
-        token,
-      };
-    }
-
-    if (clientId) {
+    if (this.credentials?.clientId) {
       this.entraTokenValidator = middleware.createEntraTokenValidator(
-        tenantId || 'common',
-        clientId,
+        this.credentials.tenantId || 'common',
+        this.credentials.clientId,
         { logger: this.log, }
       );
     }
@@ -296,10 +302,7 @@ export class App<TPlugin extends IPlugin = IPlugin> {
     this.container.register('name', { useValue: this.name });
     this.container.register('manifest', { useValue: this.manifest });
     this.container.register('credentials', { useValue: this.credentials });
-    this.container.register('botToken', { useValue: () => this.tokens.bot });
-    this.container.register('graphToken', {
-      useValue: () => this.tokens.graph,
-    });
+    this.container.register('botToken', { useValue: () => this.getBotToken() });
     this.container.register('ILogger', { useValue: this.log });
     this.container.register('IStorage', { useValue: this.storage });
     this.container.register(this.client.constructor.name, {
@@ -352,8 +355,6 @@ export class App<TPlugin extends IPlugin = IPlugin> {
     this.port = port || process.env.PORT || 3978;
 
     try {
-      await this.refreshTokens(true);
-
       // initialize plugins
       for (const plugin of this.plugins) {
         // inject dependencies
@@ -511,36 +512,9 @@ export class App<TPlugin extends IPlugin = IPlugin> {
   /// Token
   ///
 
-  /**
-   * Refresh the tokens for the app
-   */
-  protected async refreshTokens(force = false) {
-    return Promise.all([
-      this.refreshBotToken(force),
-      this.refreshGraphToken(force),
-    ]);
-  }
-
-  protected async refreshBotToken(force = false) {
-    if (!this.credentials) return;
-    if (!this.tokens.bot?.isExpired() && !force) return;
-    if (this.tokens.bot) {
-      this.log.debug('refreshing bot token');
-    }
-
-    const botResponse = await this.api.bots.token.get(this.credentials);
-    this._tokens.bot = new JsonWebToken(botResponse.access_token);
-  }
-
-  protected async refreshGraphToken(force = false) {
-    if (!this.credentials) return;
-    if (!this.tokens.graph?.isExpired() && !force) return;
-    if (this.tokens.graph) {
-      this.log.debug('refreshing graph token');
-    }
-
-    const graphResponse = await this.api.bots.token.getGraph(this.credentials);
-    this._tokens.graph = new JsonWebToken(graphResponse.access_token);
+  protected async getBotToken() {
+    if (!this.tokenManager) return;
+    return await this.tokenManager.getBotToken();
   }
 
   protected async getUserToken(
@@ -556,21 +530,8 @@ export class App<TPlugin extends IPlugin = IPlugin> {
     return res.token;
   }
 
-  protected async getOrRefreshTenantToken(tenantId: string) {
-    let appToken =
-      this.tenantTokens.get(tenantId);
-    if (this.credentials && !this.tenantTokens.get(tenantId)) {
-      const { access_token } = await this.api.bots.token.getGraph({
-        ...this.credentials,
-        tenantId: tenantId,
-      });
-
-      this.log.debug(`refreshing tenant token for ${tenantId}`);
-
-      appToken = access_token;
-      this.tenantTokens.set(tenantId, access_token);
-    }
-
-    return appToken;
+  protected async getAppGraphToken(tenantId?: string) {
+    if (!this.tokenManager) return;
+    return await this.tokenManager.getGraphToken(tenantId);
   }
 }

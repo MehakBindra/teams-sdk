@@ -1,4 +1,4 @@
-export type LogLevel = 'error' | 'warn' | 'info' | 'debug';
+export type LogLevel = 'error' | 'warn' | 'info' | 'debug' | 'trace';
 
 export interface ILoggerOptions {
   /**
@@ -14,6 +14,11 @@ export interface ILoggerOptions {
 }
 
 export interface ILogger {
+  /**
+   * Active logger options for this logger
+   */
+  loggerOptions?: ILoggerOptions;
+
   /**
    * Output debug message
    * @param msg any data to log
@@ -37,6 +42,12 @@ export interface ILogger {
    * @param msg any data to log
    */
   error(...msg: any[]): void;
+
+  /**
+   * Output trace messages (with stack trace)
+   * @param msg any data to log
+   */
+  trace(...msg: any[]): void;
 
   /**
    * Output log message
