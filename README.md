@@ -110,3 +110,5 @@ $: npm run test
 
 - [Teams Developer Portal: Apps](https://dev.teams.microsoft.com/apps)
 - [Teams Toolkit](https://www.npmjs.com/package/@microsoft/teamsapp-cli)
+
+<!-- Update React to 19.2.3 for CVE fixes -->
