@@ -110,3 +110,5 @@ $: npm run test
 
 - [Teams Developer Portal: Apps](https://dev.teams.microsoft.com/apps)
 - [Teams Toolkit](https://www.npmjs.com/package/@microsoft/teamsapp-cli)
+
+<!-- Migrate a2a server to sdk v 0.3.0 -->
